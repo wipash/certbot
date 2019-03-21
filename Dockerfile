@@ -15,6 +15,7 @@ RUN sh -c 'cat tools/dev_constraints.txt unhashed_requirements.txt | /opt/certbo
 
 COPY acme src/acme
 COPY certbot src/certbot
+COPY certbot-dns-azure src/certbot-dns-azure
 
 RUN apk add --no-cache --virtual .certbot-deps \
         libffi \
@@ -32,4 +33,6 @@ RUN apk add --no-cache --virtual .build-deps \
     && pip install --no-cache-dir --no-deps \
         --editable /opt/certbot/src/acme \
         --editable /opt/certbot/src \
+    && pip install --no-cache-dir \
+	    --editable /opt/certbot/src/certbot-dns-azure \
     && apk del .build-deps
