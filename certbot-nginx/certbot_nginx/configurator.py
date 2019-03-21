@@ -8,12 +8,12 @@ import tempfile
 import time
 
 import OpenSSL
-import six
 import zope.interface
 
 from acme import challenges
 from acme import crypto_util as acme_crypto_util
 
+from certbot import compat
 from certbot import constants as core_constants
 from certbot import crypto_util
 from certbot import errors
@@ -26,11 +26,16 @@ from certbot_nginx import constants
 from certbot_nginx import display_ops
 from certbot_nginx import nginxparser
 from certbot_nginx import parser
-from certbot_nginx import tls_sni_01
 from certbot_nginx import http_01
 from certbot_nginx import obj # pylint: disable=unused-import
 from acme.magic_typing import List, Dict, Set # pylint: disable=unused-import, no-name-in-module
 
+
+NAME_RANK = 0
+START_WILDCARD_RANK = 1
+END_WILDCARD_RANK = 2
+REGEX_RANK = 3
+NO_SSL_MODIFIER = 4
 
 
 logger = logging.getLogger(__name__)
@@ -136,11 +141,12 @@ class NginxConfigurator(common.Installer):
         """
         # Verify Nginx is installed
         if not util.exe_exists(self.conf('ctl')):
-            raise errors.NoInstallationError
+            raise errors.NoInstallationError(
+                "Could not find a usable 'nginx' binary. Ensure nginx exists, "
+                "the binary is executable, and your PATH is set correctly.")
 
         # Make sure configuration is valid
         self.config_test()
-
 
         self.parser = parser.NginxParser(self.conf('server-root'))
 
@@ -157,9 +163,7 @@ class NginxConfigurator(common.Installer):
             util.lock_dir_until_exit(self.conf('server-root'))
         except (OSError, errors.LockError):
             logger.debug('Encountered error:', exc_info=True)
-            raise errors.PluginError(
-                'Unable to lock %s', self.conf('server-root'))
-
+            raise errors.PluginError('Unable to lock {0}'.format(self.conf('server-root')))
 
     # Entry point in main.py for installing cert
     def deploy_cert(self, domain, cert_path, key_path,
@@ -403,7 +407,8 @@ class NginxConfigurator(common.Installer):
         """
         if not matches:
             return None
-        elif matches[0]['rank'] in six.moves.range(2, 6):
+        elif matches[0]['rank'] in [START_WILDCARD_RANK, END_WILDCARD_RANK,
+            START_WILDCARD_RANK + NO_SSL_MODIFIER, END_WILDCARD_RANK + NO_SSL_MODIFIER]:
             # Wildcard match - need to find the longest one
             rank = matches[0]['rank']
             wildcards = [x for x in matches if x['rank'] == rank]
@@ -412,10 +417,9 @@ class NginxConfigurator(common.Installer):
             # Exact or regex match
             return matches[0]['vhost']
 
-
-    def _rank_matches_by_name_and_ssl(self, vhost_list, target_name):
+    def _rank_matches_by_name(self, vhost_list, target_name):
         """Returns a ranked list of vhosts from vhost_list that match target_name.
-        The ranking gives preference to SSL vhosts.
+        This method should always be followed by a call to _select_best_name_match.
 
         :param list vhost_list: list of vhosts to filter and rank
         :param str target_name: The name to match
@@ -435,21 +439,37 @@ class NginxConfigurator(common.Installer):
             if name_type == 'exact':
                 matches.append({'vhost': vhost,
                                 'name': name,
-                                'rank': 0 if vhost.ssl else 1})
+                                'rank': NAME_RANK})
             elif name_type == 'wildcard_start':
                 matches.append({'vhost': vhost,
                                 'name': name,
-                                'rank': 2 if vhost.ssl else 3})
+                                'rank': START_WILDCARD_RANK})
             elif name_type == 'wildcard_end':
                 matches.append({'vhost': vhost,
                                 'name': name,
-                                'rank': 4 if vhost.ssl else 5})
+                                'rank': END_WILDCARD_RANK})
             elif name_type == 'regex':
                 matches.append({'vhost': vhost,
                                 'name': name,
-                                'rank': 6 if vhost.ssl else 7})
+                                'rank': REGEX_RANK})
         return sorted(matches, key=lambda x: x['rank'])
 
+    def _rank_matches_by_name_and_ssl(self, vhost_list, target_name):
+        """Returns a ranked list of vhosts from vhost_list that match target_name.
+        The ranking gives preference to SSLishness before name match level.
+
+        :param list vhost_list: list of vhosts to filter and rank
+        :param str target_name: The name to match
+        :returns: list of dicts containing the vhost, the matching name, and
+            the numerical rank
+        :rtype: list
+
+        """
+        matches = self._rank_matches_by_name(vhost_list, target_name)
+        for match in matches:
+            if not match['vhost'].ssl:
+                match['rank'] += NO_SSL_MODIFIER
+        return sorted(matches, key=lambda x: x['rank'])
 
     def choose_redirect_vhosts(self, target_name, port, create_if_no_match=False):
         """Chooses a single virtual host for redirect enhancement.
@@ -529,9 +549,7 @@ class NginxConfigurator(common.Installer):
 
         matching_vhosts = [vhost for vhost in all_vhosts if _vhost_matches(vhost, port)]
 
-        # We can use this ranking function because sslishness doesn't matter to us, and
-        # there shouldn't be conflicting plaintextish servers listening on 80.
-        return self._rank_matches_by_name_and_ssl(matching_vhosts, target_name)
+        return self._rank_matches_by_name(matching_vhosts, target_name)
 
     def get_all_names(self):
         """Returns all names found in the Nginx Configuration.
@@ -541,7 +559,7 @@ class NginxConfigurator(common.Installer):
         :rtype: set
 
         """
-        all_names = set() # type: Set[str]
+        all_names = set()  # type: Set[str]
 
         for vhost in self.parser.get_vhosts():
             all_names.update(vhost.names)
@@ -566,6 +584,7 @@ class NginxConfigurator(common.Installer):
         return util.get_filtered_names(all_names)
 
     def _get_snakeoil_paths(self):
+        """Generate invalid certs that let us create ssl directives for Nginx"""
         # TODO: generate only once
         tmp_dir = os.path.join(self.config.work_dir, "snakeoil")
         le_key = crypto_util.init_save_key(
@@ -590,7 +609,8 @@ class NginxConfigurator(common.Installer):
         :type vhost: :class:`~certbot_nginx.obj.VirtualHost`
 
         """
-        ipv6info = self.ipv6_info(self.config.tls_sni_01_port)
+        https_port = self.config.tls_sni_01_port
+        ipv6info = self.ipv6_info(https_port)
         ipv6_block = ['']
         ipv4_block = ['']
 
@@ -604,7 +624,7 @@ class NginxConfigurator(common.Installer):
             ipv6_block = ['\n    ',
                           'listen',
                           ' ',
-                          '[::]:{0}'.format(self.config.tls_sni_01_port),
+                          '[::]:{0}'.format(https_port),
                           ' ',
                           'ssl']
             if not ipv6info[1]:
@@ -616,7 +636,7 @@ class NginxConfigurator(common.Installer):
             ipv4_block = ['\n    ',
                           'listen',
                           ' ',
-                          '{0}'.format(self.config.tls_sni_01_port),
+                          '{0}'.format(https_port),
                           ' ',
                           'ssl']
 
@@ -778,8 +798,6 @@ class NginxConfigurator(common.Installer):
         :param str domain: domain to enable redirect for
         :param `~obj.Vhost` vhost: vhost to enable redirect for
         """
-
-        http_vhost = None
         if vhost.ssl:
             http_vhost, _ = self._split_block(vhost, ['listen', 'server_name'])
 
@@ -877,7 +895,7 @@ class NginxConfigurator(common.Installer):
         have permissions of root.
 
         """
-        uid = os.geteuid()
+        uid = compat.os_geteuid()
         util.make_or_verify_dir(
             self.config.work_dir, core_constants.CONFIG_DIRS_MODE, uid)
         util.make_or_verify_dir(
@@ -1017,7 +1035,7 @@ class NginxConfigurator(common.Installer):
     ###########################################################################
     def get_chall_pref(self, unused_domain):  # pylint: disable=no-self-use
         """Return list of challenge preferences."""
-        return [challenges.TLSSNI01, challenges.HTTP01]
+        return [challenges.HTTP01, challenges.TLSSNI01]
 
     # Entry point in main.py for performing challenges
     def perform(self, achalls):
@@ -1030,19 +1048,14 @@ class NginxConfigurator(common.Installer):
         """
         self._chall_out += len(achalls)
         responses = [None] * len(achalls)
-        sni_doer = tls_sni_01.NginxTlsSni01(self)
         http_doer = http_01.NginxHttp01(self)
 
         for i, achall in enumerate(achalls):
             # Currently also have chall_doer hold associated index of the
             # challenge. This helps to put all of the responses back together
             # when they are all complete.
-            if isinstance(achall.chall, challenges.HTTP01):
-                http_doer.add_chall(achall, i)
-            else:  # tls-sni-01
-                sni_doer.add_chall(achall, i)
+            http_doer.add_chall(achall, i)
 
-        sni_response = sni_doer.perform()
         http_response = http_doer.perform()
         # Must restart in order to activate the challenges.
         # Handled here because we may be able to load up other challenge types
@@ -1051,9 +1064,8 @@ class NginxConfigurator(common.Installer):
         # Go through all of the challenges and assign them to the proper place
         # in the responses return value. All responses must be in the same order
         # as the original challenges.
-        for chall_response, chall_doer in ((sni_response, sni_doer), (http_response, http_doer)):
-            for i, resp in enumerate(chall_response):
-                responses[chall_doer.indices[i]] = resp
+        for i, resp in enumerate(http_response):
+            responses[http_doer.indices[i]] = resp
 
         return responses
 
@@ -1130,6 +1142,7 @@ def install_ssl_options_conf(options_ssl, options_ssl_digest):
     """Copy Certbot's SSL options file into the system's config dir if required."""
     return common.install_version_controlled_file(options_ssl, options_ssl_digest,
         constants.MOD_SSL_CONF_SRC, constants.ALL_SSL_OPTIONS_HASHES)
+
 
 def _determine_default_server_root():
     if os.environ.get("CERTBOT_DOCS") == "1":

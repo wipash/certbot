@@ -29,7 +29,7 @@ class Authenticator(dns_common.DNSAuthenticator):
 
     @classmethod
     def add_parser_arguments(cls, add):  # pylint: disable=arguments-differ
-        super(Authenticator, cls).add_parser_arguments(add, default_propagation_seconds=960)
+        super(Authenticator, cls).add_parser_arguments(add, default_propagation_seconds=1200)
         add('credentials', help='Linode credentials INI file.')
 
     def more_info(self):  # pylint: disable=missing-docstring,no-self-use
@@ -54,6 +54,7 @@ class Authenticator(dns_common.DNSAuthenticator):
     def _get_linode_client(self):
         return _LinodeLexiconClient(self.credentials.conf('key'))
 
+
 class _LinodeLexiconClient(dns_common_lexicon.LexiconClient):
     """
     Encapsulates all communication with the Linode API.
@@ -61,9 +62,12 @@ class _LinodeLexiconClient(dns_common_lexicon.LexiconClient):
 
     def __init__(self, api_key):
         super(_LinodeLexiconClient, self).__init__()
-        self.provider = linode.Provider({
-            'auth_token': api_key
+
+        config = dns_common_lexicon.build_lexicon_config('linode', {}, {
+            'auth_token': api_key,
         })
+
+        self.provider = linode.Provider(config)
 
     def _handle_general_error(self, e, domain_name):
         if not str(e).startswith('Domain not found'):
